@@ -1,0 +1,25 @@
+services:
+  postges:
+    image: pgvector/pgvector:pg16
+    container_name: documental-postgres
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: documental
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+    volumes:
+      - docpgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d documental"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  docpgdata:
