@@ -7,7 +7,9 @@ import java.time.LocalDateTime;
 import java.util.UUID;
 
 @Entity
-@Table(name = "document_metadata")
+@Table(name = "document_metadata", indexes = {
+        @Index(name = "idx_document_user", columnList = "user_id")
+})
 @Getter
 @Setter
 @AllArgsConstructor
@@ -18,6 +20,9 @@ public class DocumentMetadata {
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
+
+    @Column(name = "user_id")
+    private UUID userId;
 
     @Column(unique = false)
     private String fileName;

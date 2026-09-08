@@ -6,6 +6,7 @@ import documental_backend.entity.DocumentStatus;
 import documental_backend.exception.DocumentProcessingException;
 import documental_backend.exception.ResourceNotFoundException;
 import documental_backend.repository.DocumentMetaDataRepo;
+import documental_backend.security.SecurityUtils;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -32,23 +33,19 @@ public class DocumentMetaDataService {
     private static final Logger logger = LoggerFactory.getLogger(DocumentMetaDataService.class);
 
     private final DocumentMetaDataRepo documentMetaDataRepo;
-
     private final DocumentIngestionService documentIngestionService;
-
     private final DocumentParseService parseService;
-
     private final JdbcTemplate jdbcTemplate;
-
     private final ModelMapper modelMapper;
-
     private final ObjectMapper objectMapper;
 
     public DocumentResponseDto processAndUpload(MultipartFile file) {
+        UUID userId = SecurityUtils.currentUserId();
         String fileName = file.getOriginalFilename() != null ? file.getOriginalFilename() : "document";
-        String contentType = file.getContentType() != null ? file.getContentType() : "application/octet-strema";
+        String contentType = file.getContentType() != null ? file.getContentType() : "application/octet-stream";
 
-        // creating Metadata document
         DocumentMetadata documentMetadata = DocumentMetadata.builder()
+                .userId(userId)
                 .fileName(fileName)
                 .contentType(contentType)
                 .fileSize(file.getSize())
@@ -58,23 +55,16 @@ public class DocumentMetaDataService {
                 .build();
 
         documentMetadata = documentMetaDataRepo.save(documentMetadata);
-        List<Document> parsedDocs = null;
-        int chunksCreated = 0;
+        int chunksCreated;
 
         try {
-            //parse the file
-            parsedDocs = parseService.parse(file);
-
-            //ingest service
+            List<Document> parsedDocs = parseService.parse(file);
             chunksCreated = documentIngestionService.ingest(documentMetadata, parsedDocs);
-        } catch (
-                DocumentProcessingException e
-        ) {
+        } catch (DocumentProcessingException e) {
             logger.info("Document metadata deleting due to fail processing");
             documentMetaDataRepo.delete(documentMetadata);
             throw e;
         }
-
 
         return DocumentResponseDto.builder()
                 .id(documentMetadata.getId())
@@ -82,55 +72,38 @@ public class DocumentMetaDataService {
                 .fileSize(documentMetadata.getFileSize())
                 .chunkCreated(chunksCreated)
                 .status(documentMetadata.getStatus())
-                .message("Document successfully Processed and Indexed").build();
-
-
-
+                .message("Document successfully Processed and Indexed")
+                .build();
     }
+
     public List<DocumentResponseDto> uploadMultipleDocuments(List<MultipartFile> files) {
-
-
         List<DocumentResponseDto> responseDtos = new ArrayList<>();
-
         for (MultipartFile file : files) {
-            DocumentResponseDto result = this.processAndUpload(file);
-            responseDtos.add(result);
+            responseDtos.add(processAndUpload(file));
         }
-
         return responseDtos;
-
-
     }
 
     public List<DocumentMetadataDto> getAllDocuments() {
-
-        List<DocumentMetadata> allDocuments = documentMetaDataRepo.findAllByOrderByCreatedAtDesc();
-        return allDocuments.stream()
-                .map(documentMetadata -> modelMapper.map(documentMetadata, DocumentMetadataDto.class))
+        UUID userId = SecurityUtils.currentUserId();
+        return documentMetaDataRepo.findAllByUserIdOrderByCreatedAtDesc(userId).stream()
+                .map(doc -> modelMapper.map(doc, DocumentMetadataDto.class))
                 .toList();
-
     }
-
 
     public DocumentMetadataDto getDocumentById(UUID id) {
-        DocumentMetadata documentMetadata = documentMetaDataRepo.findById(id).orElseThrow(() -> new ResourceNotFoundException("Document with given id not found !!"));
+        DocumentMetadata documentMetadata = requireOwnedDocument(id);
         return modelMapper.map(documentMetadata, DocumentMetadataDto.class);
-
-
     }
 
-    /**
-     * Lists all indexed vector chunks for a document (ordered by chunkIndex).
-     * Unlike similarity search, this returns the full knowledge extraction set.
-     */
     public List<CitationDto> getDocumentChunks(UUID id) {
-        DocumentMetadata documentMetadata = documentMetaDataRepo.findById(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Document with given id not found !!"));
+        DocumentMetadata documentMetadata = requireOwnedDocument(id);
 
         String sql = """
                 SELECT content, metadata
                 FROM vector_store
                 WHERE metadata->>'documentId' = ?
+                  AND metadata->>'userId' = ?
                 """;
 
         List<CitationDto> chunks = jdbcTemplate.query(sql, (rs, rowNum) -> {
@@ -179,29 +152,59 @@ public class DocumentMetaDataService {
                     .similarityScore(null)
                     .metadata(meta)
                     .build();
-        }, id.toString());
+        }, id.toString(), documentMetadata.getUserId().toString());
+
+        // Fallback for older chunks that lack userId metadata but belong to this document
+        if (chunks.isEmpty()) {
+            chunks = jdbcTemplate.query("""
+                    SELECT content, metadata
+                    FROM vector_store
+                    WHERE metadata->>'documentId' = ?
+                    """, (rs, rowNum) -> {
+                String content = rs.getString("content");
+                String metadataJson = rs.getString("metadata");
+                Map<String, Object> meta = Map.of();
+                try {
+                    if (metadataJson != null && !metadataJson.isBlank()) {
+                        meta = objectMapper.readValue(metadataJson, new TypeReference<>() {});
+                    }
+                } catch (Exception ignored) {
+                }
+                Integer chunkIndex = meta.get("chunkIndex") instanceof Number n ? n.intValue() : null;
+                Integer pageNumber = meta.get("pageNumber") instanceof Number n ? n.intValue() : null;
+                return CitationDto.builder()
+                        .documentId(documentMetadata.getId())
+                        .fileName(documentMetadata.getFileName())
+                        .chunkIndex(chunkIndex)
+                        .pageNumber(pageNumber)
+                        .snippet(content)
+                        .build();
+            }, id.toString());
+        }
 
         chunks.sort(Comparator.comparing(
                 c -> c.getChunkIndex() == null ? Integer.MAX_VALUE : c.getChunkIndex()
         ));
-        logger.info("Listed {} chunks for document {}", chunks.size(), id);
+        logger.info("Listed {} chunks for document {} (user={})", chunks.size(), id, documentMetadata.getUserId());
         return chunks;
     }
 
     @Transactional
     public void deleteDocument(UUID id) {
-        DocumentMetadata documentMetadata = documentMetaDataRepo.findById(id).orElseThrow(() -> new ResourceNotFoundException("Document with given id not found !!"));
-
-
+        DocumentMetadata documentMetadata = requireOwnedDocument(id);
         documentMetaDataRepo.delete(documentMetadata);
-        //delete the vector entries
         try {
             String deleteVectorsSql = "DELETE FROM vector_store WHERE metadata->>'documentId' = ?";
             int deletedCount = jdbcTemplate.update(deleteVectorsSql, id.toString());
             logger.info("Deleted {} vector chunks for document id {} ", deletedCount, id);
-
         } catch (Exception e) {
-            logger.warn("cloud not delete vectors from vector store directly: {}", e.getMessage());
+            logger.warn("Could not delete vectors from vector store directly: {}", e.getMessage());
         }
+    }
+
+    public DocumentMetadata requireOwnedDocument(UUID id) {
+        UUID userId = SecurityUtils.currentUserId();
+        return documentMetaDataRepo.findByIdAndUserId(id, userId)
+                .orElseThrow(() -> new ResourceNotFoundException("Document with given id not found !!"));
     }
 }

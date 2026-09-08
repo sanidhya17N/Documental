@@ -15,6 +15,7 @@ public class AppProperties {
 
     private RagProperties rag = new RagProperties();
     private CorsProperties cors = new CorsProperties();
+    private JwtProperties jwt = new JwtProperties();
 
 
     @Getter
@@ -38,9 +39,18 @@ public class AppProperties {
     @AllArgsConstructor
     @NoArgsConstructor
     public static class CorsProperties {
-        private String allowedOrigins = "*";
+        private String allowedOrigins = "http://localhost:5173,http://127.0.0.1:5173";
         private String allowedMethods = "GET,POST,PUT,DELETE,OPTIONS";
         private String allowedHeaders = "*";
+    }
+
+    @Getter
+    @Setter
+    @AllArgsConstructor
+    @NoArgsConstructor
+    public static class JwtProperties {
+        private String secret = "documental-dev-secret-change-me-32chars-min";
+        private long expirationMs = 86400000L;
     }
 
 }

@@ -2,6 +2,9 @@ package documental_backend.service;
 
 import documental_backend.config.AppProperties;
 import documental_backend.dto.*;
+import documental_backend.exception.ResourceNotFoundException;
+import documental_backend.repository.DocumentMetaDataRepo;
+import documental_backend.security.SecurityUtils;
 import jakarta.validation.constraints.NotBlank;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -39,18 +42,22 @@ public class RagService {
     private final VectorStore vectorStore;
     private final AppProperties appProperties;
     private final ChatClient chatClient;
+    private final DocumentMetaDataRepo documentMetaDataRepo;
 
 
     public ChatResponseDto askQuestion(ChatRequestDto request) {
         long startTime = System.currentTimeMillis();
         boolean detailed = shouldAnswerInDetail(request);
-        log.info("Processing query: '{}', scoped documentId: {}, detailed={}",
-                request.getQuestion(), request.getDocumentId(), detailed);
+        UUID userId = SecurityUtils.currentUserId();
+        log.info("Processing query: '{}', userId={}, scoped documentId: {}, detailed={}",
+                request.getQuestion(), userId, request.getDocumentId(), detailed);
+
+        assertDocumentAccess(request.getDocumentId(), userId);
 
         Integer effectiveTopK = resolveTopK(request.getTopK(), detailed);
         long retrieveStart = System.currentTimeMillis();
         List<Document> similarDocuments = this.retrieveRelevantDocuments(
-                request.getQuestion(), request.getDocumentId(), effectiveTopK, request.getMinSimilarity());
+                request.getQuestion(), userId, request.getDocumentId(), effectiveTopK, request.getMinSimilarity());
         long retrieveMs = System.currentTimeMillis() - retrieveStart;
 
         List<CitationDto> citationDtos = similarDocuments.stream().map(this::mapToCitation).toList();
@@ -81,12 +88,16 @@ public class RagService {
 
     public Flux<String> streamQuestionAnswer(ChatRequestDto requestDto) {
         boolean detailed = shouldAnswerInDetail(requestDto);
-        log.info("Streaming query: '{}', detailed={}", requestDto.getQuestion(), detailed);
+        UUID userId = SecurityUtils.currentUserId();
+        log.info("Streaming query: '{}', userId={}, detailed={}", requestDto.getQuestion(), userId, detailed);
+
+        assertDocumentAccess(requestDto.getDocumentId(), userId);
 
         Integer effectiveTopK = resolveTopK(requestDto.getTopK(), detailed);
         long retrieveStart = System.currentTimeMillis();
         List<Document> relevantDocuments = retrieveRelevantDocuments(
                 requestDto.getQuestion(),
+                userId,
                 requestDto.getDocumentId(),
                 effectiveTopK,
                 requestDto.getMinSimilarity()
@@ -209,14 +220,25 @@ public class RagService {
     }
 
     public SearchResultDto searchSimilarChunks(SearchRequestDto request) {
+        UUID userId = SecurityUtils.currentUserId();
+        assertDocumentAccess(request.getDocumentId(), userId);
         List<Document> matchedDocs = retrieveRelevantDocuments(
-                request.getQuery(), request.getDocumentId(), request.getTopK(), request.getSimilaritySearch());
+                request.getQuery(), userId, request.getDocumentId(), request.getTopK(), request.getSimilaritySearch());
         List<CitationDto> citations = matchedDocs.stream().map(this::mapToCitation).toList();
         return SearchResultDto.builder()
                 .query(request.getQuery())
                 .totalMatches(citations.size())
                 .matches(citations)
                 .build();
+    }
+
+    private void assertDocumentAccess(UUID documentId, UUID userId) {
+        if (documentId == null) {
+            return;
+        }
+        if (!documentMetaDataRepo.existsByIdAndUserId(documentId, userId)) {
+            throw new ResourceNotFoundException("Document with given id not found !!");
+        }
     }
 
     private CitationDto mapToCitation(Document document) {
@@ -257,6 +279,7 @@ public class RagService {
 
     private List<Document> retrieveRelevantDocuments(
             @NotBlank(message = "Question cannot be empty") String query,
+            UUID userId,
             UUID documentId,
             Integer topK,
             Double similaritySearch
@@ -272,16 +295,24 @@ public class RagService {
             searchRequestBuilder.similarityThreshold(effectiveSimilarity);
         }
 
+        FilterExpressionBuilder b = new FilterExpressionBuilder();
+        Filter.Expression expression;
         if (documentId != null) {
-            log.info("Filtering from document: {}", documentId);
-            FilterExpressionBuilder b = new FilterExpressionBuilder();
-            Filter.Expression expression = b.eq("documentId", documentId.toString()).build();
-            searchRequestBuilder.filterExpression(expression);
+            log.info("Filtering userId={} and documentId={}", userId, documentId);
+            expression = b.and(
+                    b.eq("userId", userId.toString()),
+                    b.eq("documentId", documentId.toString())
+            ).build();
+        } else {
+            log.info("Filtering userId={}", userId);
+            expression = b.eq("userId", userId.toString()).build();
         }
+        searchRequestBuilder.filterExpression(expression);
 
         try {
             List<Document> documents = vectorStore.similaritySearch(searchRequestBuilder.build());
-            log.info("Retrieved {} chunks for query: '{}' (scoped docId: {})", documents.size(), query, documentId);
+            log.info("Retrieved {} chunks for query: '{}' (userId={}, scoped docId: {})",
+                    documents.size(), query, userId, documentId);
             return documents;
         } catch (Exception e) {
             log.error("Similarity search failed for query: '{}'", query, e);

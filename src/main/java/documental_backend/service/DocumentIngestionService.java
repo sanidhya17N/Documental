@@ -58,6 +58,7 @@ public class DocumentIngestionService {
                 Document chunk = chunks.get(i);
                 Map<String, Object> enrichedMetadata = new HashMap<>(chunk.getMetadata());
                 enrichedMetadata.put("documentId", documentMetadata.getId().toString());
+                enrichedMetadata.put("userId", documentMetadata.getUserId().toString());
                 enrichedMetadata.put("fileName", documentMetadata.getFileName());
                 enrichedMetadata.put("contentType", documentMetadata.getContentType());
                 enrichedMetadata.put("chunkIndex", i);

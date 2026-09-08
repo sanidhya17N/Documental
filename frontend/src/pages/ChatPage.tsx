@@ -110,13 +110,17 @@ export function ChatPage() {
         ),
       )
     } catch (e) {
-      setError(getErrorMessage(e))
+      const message = getErrorMessage(e)
+      setError(message)
       setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId && !m.content
-            ? { ...m, content: 'Sorry — I could not generate a response.' }
-            : m,
-        ),
+        prev.map((m) => {
+          if (m.id !== assistantId) return m
+          if (m.content) {
+            // Keep partial streamed answer; surface interruption in the banner
+            return m
+          }
+          return { ...m, content: 'Sorry — I could not generate a response.' }
+        }),
       )
     } finally {
       setLoading(false)

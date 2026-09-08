@@ -1,7 +1,5 @@
-import { api, unwrap } from './client'
+import { api, unwrap, getAuthHeader, API_BASE } from './client'
 import type { ChatRequest, ChatResponse, Citation, SearchRequest, SearchResult } from '@/types'
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api/v1'
 
 export async function askQuestion(request: ChatRequest): Promise<ChatResponse> {
   const res = await api.post('/chat/query', request)
@@ -18,7 +16,6 @@ function decodeSsePayload(raw: string): string | null {
   if (payload.startsWith(' ')) payload = payload.slice(1)
   if (!payload || payload === '[DONE]') return null
 
-  // Spring may JSON-encode string events: "hello" or "line\n"
   if (
     (payload.startsWith('"') && payload.endsWith('"')) ||
     (payload.startsWith("'") && payload.endsWith("'"))
@@ -26,10 +23,33 @@ function decodeSsePayload(raw: string): string | null {
     try {
       return JSON.parse(payload) as string
     } catch {
-      // fall through — treat as plain text
+      // fall through
     }
   }
   return payload
+}
+
+async function parseHttpError(response: Response): Promise<string> {
+  const text = await response.text()
+  if (!text) {
+    if (response.status === 401) return 'Session expired — please sign in again'
+    if (response.status === 403) return 'Access denied'
+    if (response.status === 422) return 'Could not process this request'
+    return `Request failed (${response.status})`
+  }
+  try {
+    const json = JSON.parse(text) as { message?: string }
+    if (json.message) return json.message
+  } catch {
+    // not JSON
+  }
+  // Avoid dumping huge HTML/stack traces into the UI
+  if (text.length > 220 || text.trimStart().startsWith('<')) {
+    if (response.status === 401) return 'Session expired — please sign in again'
+    if (response.status === 403) return 'Access denied while streaming. Please retry.'
+    return `Request failed (${response.status})`
+  }
+  return text
 }
 
 /**
@@ -42,9 +62,10 @@ export async function streamQuestion(
     onToken: (token: string) => void
     onCitations?: (citations: Citation[]) => void
   },
-): Promise<{ conversationId: string; citations: Citation[] }> {
+): Promise<{ conversationId: string; citations: Citation[]; receivedTokens: boolean }> {
   const conversationId = request.conversationId || crypto.randomUUID()
   const body = { ...request, conversationId }
+  let receivedTokens = false
 
   const citationsPromise = searchSimilar({
     query: request.question,
@@ -58,18 +79,23 @@ export async function streamQuestion(
     })
     .catch(() => [] as Citation[])
 
-  const response = await fetch(`${API_BASE}/chat/stream`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'text/event-stream',
-    },
-    body: JSON.stringify(body),
-  })
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+        ...getAuthHeader(),
+      },
+      body: JSON.stringify(body),
+    })
+  } catch {
+    throw new Error('Could not reach the server. Check that the backend is running.')
+  }
 
   if (!response.ok) {
-    const text = await response.text()
-    throw new Error(text || `Stream failed (${response.status})`)
+    throw new Error(await parseHttpError(response))
   }
 
   if (!response.body) {
@@ -88,34 +114,47 @@ export async function streamQuestion(
     }
     if (trimmed.startsWith('data:')) {
       const decoded = decodeSsePayload(trimmed.slice(5))
-      if (decoded != null && decoded.length > 0) handlers.onToken(decoded)
+      if (decoded != null && decoded.length > 0) {
+        receivedTokens = true
+        handlers.onToken(decoded)
+      }
       return
     }
-    // Non-SSE framing fallback (raw chunk text)
+    receivedTokens = true
     handlers.onToken(trimmed)
   }
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
 
-    // SSE events are separated by blank lines; also flush complete lines as they arrive
-    let newlineIdx = buffer.indexOf('\n')
-    while (newlineIdx !== -1) {
-      const line = buffer.slice(0, newlineIdx)
-      buffer = buffer.slice(newlineIdx + 1)
-      emitDataLine(line)
-      newlineIdx = buffer.indexOf('\n')
+      let newlineIdx = buffer.indexOf('\n')
+      while (newlineIdx !== -1) {
+        const line = buffer.slice(0, newlineIdx)
+        buffer = buffer.slice(newlineIdx + 1)
+        emitDataLine(line)
+        newlineIdx = buffer.indexOf('\n')
+      }
     }
-  }
 
-  // Flush decoder + any remaining line (final token with no trailing newline)
-  buffer += decoder.decode()
-  if (buffer.length > 0) {
-    emitDataLine(buffer)
+    buffer += decoder.decode()
+    if (buffer.length > 0) {
+      emitDataLine(buffer)
+    }
+  } catch (err) {
+    if (receivedTokens) {
+      throw new Error(
+        'The answer stream was interrupted. Partial response is shown above — please retry if needed.',
+      )
+    }
+    if (err instanceof Error && /network|fetch|abort/i.test(err.message)) {
+      throw new Error('Connection lost while waiting for the answer. Please try again.')
+    }
+    throw err
   }
 
   const citations = await citationsPromise
-  return { conversationId, citations }
+  return { conversationId, citations, receivedTokens }
 }
