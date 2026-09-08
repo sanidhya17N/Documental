@@ -70,7 +70,7 @@ app:
     similarity-threshold: 0.0
 
   cors:
-    allowed-origins: "http://localhost:5173,http://127.0.0.1:5173"
+    allowed-origins: "https://documental-jet.vercel.app,http://localhost:5173,http://127.0.0.1:5173"
     allowed-methods: GET,POST,PUT,DELETE,OPTIONS
     allowed-headers: "*"
 
